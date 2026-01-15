@@ -1472,22 +1472,466 @@ function exportLedgerCSV() {
     }
 }
 
-// --- 智能解析函数（保持原有逻辑）---
+// --- 智能解析函数（OTC/SCN价格优先级版）---
 function parseLine(line, monthMap) {
-    // 保持原有的智能解析逻辑
-    // 这里为了简洁，省略了详细实现
-    // 使用之前的优化版本
-    return [{ isValid: false }];
+    try {
+        let specificPrices = [];
+        let isOtcPrice = false;
+        let isScnPrice = false;
+        let otcPrice = null;
+        let scnPrice = null;
+        let basePrice = null;
+        
+        // 清理文本
+        let cleanLine = line;
+        
+        // 检测 "pm" 标记（代表strip交易）
+        const isPmStrip = /\bpm\b/i.test(cleanLine);
+        
+        // 检测 "curve" 标记
+        const isCurve = /\bcurve\b/i.test(cleanLine);
+        
+        // 首先提取所有数字
+        const allNumbers = cleanLine.match(/-?\d+(\.\d+)?/g) || [];
+        const numbers = allNumbers.map(Number);
+        
+        // 特别处理SCN和OTC价格同时出现的情况
+        // 匹配模式: "64.12 scn, 64.10 otc"
+        const scnOtcPattern = /(\d+(\.\d+)?)\s*scn\s*,\s*(\d+(\.\d+)?)\s*otc/gi;
+        const scnOtcMatch = cleanLine.match(scnOtcPattern);
+        
+        if (scnOtcMatch) {
+            const priceMatch = scnOtcMatch[0].match(/(\d+(\.\d+)?)/g);
+            if (priceMatch && priceMatch.length >= 2) {
+                scnPrice = parseFloat(priceMatch[0]);
+                otcPrice = parseFloat(priceMatch[1]);
+                
+                // OTC价格优先级高于SCN
+                isOtcPrice = true;
+                basePrice = otcPrice;
+                
+                // 从文本中移除这个模式，避免重复解析
+                cleanLine = cleanLine.replace(scnOtcPattern, '');
+            }
+        } else {
+            // 分别检查OTC和SCN价格
+            const otcMatch = cleanLine.match(/otc[\s@\-]*(\d+(\.\d+)?)/i);
+            if (otcMatch) {
+                otcPrice = parseFloat(otcMatch[1]);
+                isOtcPrice = true;
+                basePrice = otcPrice;
+            }
+            
+            const scnMatch = cleanLine.match(/scn[\s@\-]*(\d+(\.\d+)?)/i);
+            if (scnMatch) {
+                scnPrice = parseFloat(scnMatch[1]);
+                isScnPrice = true;
+                // 如果没有OTC价格，才使用SCN价格
+                if (!isOtcPrice) {
+                    basePrice = scnPrice;
+                }
+            }
+        }
+        
+        // 检查括号内的价格信息
+        const parensMatch = cleanLine.match(/\(([^)]+)\)/);
+        if (parensMatch) {
+            const content = parensMatch[1];
+            
+            // 检查括号内是否有OTC或SCN价格
+            const parensOtcMatch = content.match(/otc[\s@\-]*(\d+(\.\d+)?)/i);
+            const parensScnMatch = content.match(/scn[\s@\-]*(\d+(\.\d+)?)/i);
+            
+            if (parensOtcMatch && !otcPrice) {
+                otcPrice = parseFloat(parensOtcMatch[1]);
+                isOtcPrice = true;
+                basePrice = otcPrice;
+            } else if (parensScnMatch && !scnPrice && !otcPrice) {
+                scnPrice = parseFloat(parensScnMatch[1]);
+                isScnPrice = true;
+                basePrice = scnPrice;
+            }
+            
+            cleanLine = cleanLine.replace(parensMatch[0], '');
+        }
+        
+        // 清理行首序号和多余文本
+        cleanLine = cleanLine.replace(/^\s*\d+[.)\s]+/, '');
+        cleanLine = cleanLine.replace(/to confirm\s+u\s+/gi, '');
+        
+        const upperLine = cleanLine.toUpperCase();
+        
+        // 检查整个文本是否有OTC或SCN标记
+        if (/OTC|场外|柜台/.test(upperLine) && !isOtcPrice) {
+            isOtcPrice = true;
+        }
+        
+        if (/SCN/.test(upperLine) && !isScnPrice && !isOtcPrice) {
+            isScnPrice = true;
+        }
+        
+        let isValid = true;
+        let trader = document.getElementById('trader').value;
+        let product = '', contract = '', side = 1, qty = 0, price = basePrice || 0;
+        const results = [];
+        let matchedContractString = '';
+        
+        // 交易员检测
+        if (/\bW\b/.test(upperLine)) trader = 'W'; 
+        else if (/\bL\b/.test(upperLine)) trader = 'L'; 
+        else if (/\bZ\b/.test(upperLine)) trader = 'Z';
+        
+        // 方向检测
+        if (/SELL|SOLD|SHORT|卖|平/.test(upperLine)) side = -1; 
+        else if (/BOT|BOUGHT|BUY|LONG|买|建/.test(upperLine)) side = 1;
+        
+        // 品种检测
+        let isHH = false, isBrent = false;
+        if (/HH|HENRY|HUB/.test(upperLine)) { 
+            isHH = true; 
+            product = 'Henry Hub'; 
+        } else if (/BRT|BRENT/.test(upperLine) || /\b(25|26)\d{2}\b/.test(upperLine)) { 
+            isBrent = true; 
+            product = 'Brent'; 
+        }
+        
+        // 合约检测
+        const rangeMatch = upperLine.match(/\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(-|TO)\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/);
+        let startMonthIdx = -1, endMonthIdx = -1, singleContract = '';
+
+        if (rangeMatch) {
+            startMonthIdx = parseInt(monthMap[rangeMatch[1]]) - 1;
+            endMonthIdx = parseInt(monthMap[rangeMatch[3]]) - 1;
+            matchedContractString = rangeMatch[0];
+            if (!product) product = 'Brent';
+        } else {
+            const hhCodeMatch = upperLine.match(/HH\d{4}/);
+            const brentCodeMatch = upperLine.match(/\b(25|26)\d{2}\b/);
+            const monthYearMatch1 = upperLine.match(/\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*(\d{2})?\b/);
+            const monthYearMatch2 = upperLine.match(/\b(\d{2})-(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/);
+
+            if (hhCodeMatch) { 
+                product = 'Henry Hub'; 
+                singleContract = hhCodeMatch[0]; 
+                matchedContractString = hhCodeMatch[0]; 
+            } else if (brentCodeMatch) { 
+                product = 'Brent'; 
+                singleContract = brentCodeMatch[0]; 
+                matchedContractString = brentCodeMatch[0]; 
+            } else if (monthYearMatch2) {
+                if (!product) product = 'Brent';
+                const yStr = monthYearMatch2[1];
+                const mStr = monthYearMatch2[2];
+                singleContract = yStr + monthMap[mStr];
+                matchedContractString = monthYearMatch2[0];
+            } else if (monthYearMatch1) {
+                if (!product) product = 'Brent';
+                const mStr = monthYearMatch1[1];
+                const yStr = monthYearMatch1[2] || '26';
+                singleContract = yStr + monthMap[mStr];
+                matchedContractString = monthYearMatch1[0];
+            }
+        }
+
+        // 提取数字（如果还没有价格）
+        let textForNums = upperLine;
+        if (matchedContractString) textForNums = textForNums.replace(matchedContractString, '');
+        
+        // 移除关键字，保留数字
+        textForNums = textForNums.replace(/BRT|BRENT|HH|HENRY|HUB|SOLD|SELL|SHORT|BOT|BOUGHT|BUY|LONG|PM|OTC|SCN|AT|KB|LOTS?|CURVE/gi, '');
+        
+        // 如果还没有价格，尝试从剩余文本中提取
+        if (price === 0 && numbers.length > 0) {
+            const remainingNums = numbers.filter(n => {
+                // 过滤掉可能已经识别的价格
+                if (otcPrice && Math.abs(n) === otcPrice) return false;
+                if (scnPrice && Math.abs(n) === scnPrice) return false;
+                return true;
+            });
+            
+            if (remainingNums.length > 0) {
+                // 优先使用"at"关键字后面的数字作为价格
+                const atMatch = upperLine.match(/AT\s*(\d+(\.\d+)?)/i);
+                if (atMatch) {
+                    price = parseFloat(atMatch[1]);
+                } else if (remainingNums.length >= 2) {
+                    // 智能判断：通常第一个是数量，第二个是价格
+                    const n1 = Math.abs(remainingNums[0]);
+                    const n2 = Math.abs(remainingNums[1]);
+                    
+                    if (product === 'Henry Hub') {
+                        if (n1 < 5 && n1 > 0.5 && n2 >= 1) {
+                            price = n1;
+                            qty = n2;
+                        } else if (n2 < 5 && n2 > 0.5 && n1 >= 1) {
+                            price = n2;
+                            qty = n1;
+                        } else {
+                            qty = n1;
+                            price = n2;
+                        }
+                    } else { // Brent
+                        if (n1 > 50 && n1 < 150 && n2 >= 1) {
+                            price = n1;
+                            qty = n2;
+                        } else if (n2 > 50 && n2 < 150 && n1 >= 1) {
+                            price = n2;
+                            qty = n1;
+                        } else {
+                            qty = n1;
+                            price = n2;
+                        }
+                    }
+                } else if (remainingNums.length === 1) {
+                    // 如果只有一个数字，可能是数量或价格
+                    const num = Math.abs(remainingNums[0]);
+                    if (product === 'Henry Hub' && num < 5 && num > 0.5) {
+                        price = num;
+                    } else if (product === 'Brent' && num > 50 && num < 150) {
+                        price = num;
+                    } else {
+                        qty = num;
+                    }
+                }
+            }
+        }
+        
+        // 优先使用X表示的数量
+        const qtyXMatch = upperLine.match(/(\d+(\.\d+)?)X/);
+        const qtyLotsMatch = upperLine.match(/(\d+(\.\d+)?)\s*(LOTS?|KB)/);
+        
+        if (qtyXMatch) { 
+            qty = parseFloat(qtyXMatch[1]); 
+        } else if (qtyLotsMatch) { 
+            qty = parseFloat(qtyLotsMatch[1]); 
+        }
+        
+        // 验证：如果是OTC或SCN交易但没有价格，设为无效
+        if ((isOtcPrice || isScnPrice) && price === 0) {
+            isValid = false;
+        }
+        
+        // 验证数量不为0
+        if (qty === 0) {
+            // 尝试从数字中提取数量
+            for (const num of numbers) {
+                if (num > 1 && num <= 1000) { // 合理的数量范围
+                    qty = num;
+                    break;
+                }
+            }
+            if (qty === 0) isValid = false;
+        }
+        
+        // 如果是strip交易，生成多条记录
+        if (rangeMatch && isValid) {
+            const year = '26'; 
+            const totalMonths = endMonthIdx - startMonthIdx + 1;
+            
+            // 检查是否有特定的价格列表
+            if (specificPrices.length === 0) {
+                // 尝试从文本中提取价格列表
+                const priceListMatch = cleanLine.match(/(\d+(\.\d+)?\s+)+/);
+                if (priceListMatch) {
+                    const priceStrs = priceListMatch[0].match(/\d+(\.\d+)?/g);
+                    if (priceStrs) {
+                        specificPrices = priceStrs.map(Number);
+                    }
+                }
+            }
+            
+            // 如果价格列表数量等于月份数+1，且第一个价格等于basePrice，则去掉第一个
+            if (specificPrices.length === totalMonths + 1 && price !== 0) {
+                if (Math.abs(specificPrices[0] - price) < 0.01) {
+                    specificPrices = specificPrices.slice(1);
+                }
+            }
+            
+            // 对于pm标记的strip交易，所有月份使用相同价格
+            if (isPmStrip || isCurve) {
+                // 所有月份使用相同的价格
+                for (let i = 0; i < totalMonths; i++) {
+                    let monthCode = String(startMonthIdx + i + 1).padStart(2, '0');
+                    let genContract = year + monthCode;
+                    
+                    results.push({ 
+                        isValid: true, 
+                        trader, 
+                        product, 
+                        contract: genContract, 
+                        side, 
+                        qty, 
+                        price: price,
+                        finalQty: qty * side,
+                        isOtcPrice: isOtcPrice,
+                        isScnPrice: isScnPrice,
+                        isStrip: true,
+                        stripType: isPmStrip ? 'pm' : (isCurve ? 'curve' : 'regular')
+                    });
+                }
+            } else {
+                // 普通strip交易，可能有不同的价格
+                for (let i = 0; i < totalMonths; i++) {
+                    let monthCode = String(startMonthIdx + i + 1).padStart(2, '0');
+                    let genContract = year + monthCode;
+                    let finalPrice = price;
+                    
+                    if (specificPrices.length >= totalMonths) {
+                        finalPrice = specificPrices[i];
+                    } else if (specificPrices.length > 0 && specificPrices.length < totalMonths) {
+                        finalPrice = specificPrices[i] || price; 
+                    }
+
+                    results.push({ 
+                        isValid: true, 
+                        trader, 
+                        product, 
+                        contract: genContract, 
+                        side, 
+                        qty, 
+                        price: finalPrice, 
+                        finalQty: qty * side,
+                        isOtcPrice: isOtcPrice,
+                        isScnPrice: isScnPrice,
+                        isStrip: true
+                    });
+                }
+            }
+        } else {
+            if (!product) { isValid = false; }
+            results.push({ 
+                isValid, 
+                trader, 
+                product, 
+                contract: singleContract, 
+                side, 
+                qty, 
+                price, 
+                finalQty: qty * side,
+                isOtcPrice: isOtcPrice,
+                isScnPrice: isScnPrice,
+                isStrip: false
+            });
+        }
+        return results;
+    } catch (e) { 
+        console.error("Parse error", e, line); 
+        return [{ isValid: false }]; 
+    }
 }
 
 function parseImportText() {
-    // 保持原有的解析逻辑
-    console.log('开始解析导入文本');
+    const text = document.getElementById('batch-input').value;
+    const rawLines = text.split('\n').filter(line => line.trim() !== '');
+    
+    // 合并连续的价格行
+    const mergedLines = [];
+    rawLines.forEach((line) => {
+        const isPriceList = /^\s*(\d+(\.\d+)?(\s+|$))+/.test(line) && !/[a-zA-Z]/.test(line);
+        if (isPriceList && mergedLines.length > 0) {
+             mergedLines[mergedLines.length - 1] += " " + line;
+        } else {
+             mergedLines.push(line);
+        }
+    });
+
+    const previewBody = document.getElementById('import-preview-body');
+    previewBody.innerHTML = '';
+    parsedTradesBuffer = [];
+    
+    let validCount = 0;
+    let otcCount = 0;
+    let scnCount = 0;
+    let stripCount = 0;
+
+    const monthMap = { 
+        'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 
+        'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08', 
+        'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12' 
+    };
+
+    mergedLines.forEach((line) => {
+        const trades = parseLine(line, monthMap); 
+        trades.forEach(trade => {
+             parsedTradesBuffer.push(trade);
+             if (trade.isValid) {
+                 validCount++;
+                 if (trade.isOtcPrice) otcCount++;
+                 if (trade.isScnPrice) scnCount++;
+                 if (trade.isStrip) stripCount++;
+             }
+
+             const row = document.createElement('tr');
+             row.className = 'border-b ' + (trade.isValid ? 'bg-white' : 'bg-red-50');
+             
+             // 为交易添加特殊标记
+             let badges = '';
+             if (trade.isOtcPrice) badges += '<span class="otc-badge">OTC</span>';
+             if (trade.isScnPrice) badges += '<span class="scn-badge">SCN</span>';
+             if (trade.isStrip) badges += '<span class="bg-purple-100 text-purple-800 text-xs px-2 py-0.5 rounded ml-1">Strip</span>';
+             
+             row.innerHTML = `
+                 <td class="px-4 py-2 ${trade.isValid ? 'text-green-600' : 'text-red-600'} font-bold">
+                     ${trade.isValid ? '有效' : '无效'}
+                 </td>
+                 <td class="px-4 py-2">${trade.trader || '-'}</td>
+                 <td class="px-4 py-2">${trade.product || '-'}</td>
+                 <td class="px-4 py-2">${trade.contract || '-'}</td>
+                 <td class="px-4 py-2">${trade.side === 1 ? '买入' : '卖出'}</td>
+                 <td class="px-4 py-2">${trade.qty ? trade.qty : '-'}</td>
+                 <td class="px-4 py-2">
+                     ${trade.price ? trade.price : '-'}
+                     ${badges}
+                 </td>
+             `;
+             previewBody.appendChild(row);
+        });
+    });
+
+    let summaryText = `解析完成：共 ${mergedLines.length} 行，有效生成 ${validCount} 笔交易`;
+    const typeSummary = [];
+    if (otcCount > 0) typeSummary.push(`${otcCount} 笔OTC`);
+    if (scnCount > 0) typeSummary.push(`${scnCount} 笔SCN`);
+    if (stripCount > 0) typeSummary.push(`${stripCount} 笔Strip`);
+    
+    if (typeSummary.length > 0) {
+        summaryText += ` (${typeSummary.join(', ')})`;
+    }
+    
+    document.getElementById('import-summary').textContent = summaryText;
+    document.getElementById('btn-batch-submit').disabled = validCount === 0;
+    document.getElementById('import-preview-container').classList.remove('hidden');
 }
 
 function batchSubmitTrades() {
-    // 保持原有的批量提交逻辑
-    console.log('批量提交交易');
+    const validTrades = parsedTradesBuffer.filter(t => t.isValid);
+    if (validTrades.length === 0) return;
+    
+    const otcTrades = validTrades.filter(t => t.isOtcPrice);
+    const scnTrades = validTrades.filter(t => t.isScnPrice);
+    const stripTrades = validTrades.filter(t => t.isStrip);
+    
+    let message = `成功导入 ${validTrades.length} 条交易记录。`;
+    
+    const typeMessages = [];
+    if (otcTrades.length > 0) typeMessages.push(`${otcTrades.length} 条为OTC交易`);
+    if (scnTrades.length > 0) typeMessages.push(`${scnTrades.length} 条为SCN交易`);
+    if (stripTrades.length > 0) typeMessages.push(`${stripTrades.length} 条为Strip交易`);
+    
+    if (typeMessages.length > 0) {
+        message += `\n\n其中 ${typeMessages.join('，')}。`;
+        
+        if (otcTrades.length > 0) {
+            message += `\nOTC价格已优先作为成交价录入系统。`;
+        }
+    }
+    
+    validTrades.forEach(t => { 
+        addTransaction(t.trader, t.product, t.contract, t.finalQty, t.price, 'regular', t.isOtcPrice, t.isScnPrice); 
+    });
+    
+    openInfoModal('批量导入成功', message);
+    closeBatchImportModal();
 }
 
 // --- RENDER FUNCTIONS ---
